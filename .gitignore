@@ -1,0 +1,15 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Rendered HTML and PDF from Rmd
+*.html
+*.pdf
+*.png
+
+# Slurm output files 
+slurm-*.out
+
+# BRMS model fits
+*.rds

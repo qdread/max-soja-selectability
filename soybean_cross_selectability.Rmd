@@ -1,0 +1,525 @@
+---
+title: "Selectable progeny from soybean crosses"
+author: "Quentin D. Read"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Change log
+
+- 29 Mar: clean version to be included with repo for publication
+- 08 Mar: add post-hoc contrasts and Bayes factors to specifically test some of the differences between groups; improve figures and tables
+- 13 Jan: first version
+
+## Setup
+
+Load the necessary packages and data. Combine the two tabs into a single data frame, correcting names and cleaning where necessary. Also include the 100-seed average weight data.
+
+```{r}
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(brms)
+library(emmeans)
+library(tidybayes)
+library(ggtext)
+library(bayestestR)
+library(effectsize)
+library(Rutilitybelt) # This package may be installed by calling remotes::install_github('qdread/Rutilitybelt')
+
+options(mc.cores = 4, brms.backend = 'cmdstanr', brms.file_refit = 'on_change')
+```
+
+```{r, echo = FALSE}
+windowsFonts(`fgbook` = windowsFont("Franklin Gothic Book"))
+th <- theme_bw(base_family = 'fgbook') + 
+  theme(panel.grid = element_blank(),
+        strip.background = element_blank())
+theme_set(th)
+```
+
+```{r}
+cla <- read_xlsx('data/Multi Max counts incl plant info.xlsx', sheet = 'CLA') |> setDT()
+ff <- read_xlsx('data/Multi Max counts incl plant info.xlsx', sheet = 'FF') |> setDT()
+seedwt <- read_xlsx('data/seed size.xlsx', sheet = 1) |> setDT()
+```
+
+```{r}
+correct_names <- c('F3_location', 'plot', 'pop', 'max', 'soja', 'F2loc_size', 'n_planted', 'n_selected')
+setnames(cla, correct_names)
+setnames(ff, correct_names)
+
+dat <- rbind(cla, ff)
+
+dat[, pop := trimws(gsub('pop:', '', tolower(pop), fixed = TRUE))]
+dat[, plot := trimws(gsub('plot:', '', tolower(plot), fixed = TRUE))]
+
+dat <- separate(dat, F2loc_size, into = c('F2_location', 'size'), sep = '-')
+
+dat[, size := gsub('size: ', '', tolower(size), fixed = TRUE)]
+dat[, size := gsub('>1', '> 1', size, fixed = TRUE)]
+dat[, size := gsub('103', '10 3', size, fixed = TRUE)]
+
+dat[, F3_location := ifelse(grepl('CLA', F3_location), 'CLA', 'FF')]
+```
+
+Look at the size and F2 location values. It looks like some were done with size class cutoffs (8 3/4, 10, 11 1/2, and 12), and some were done with size class cutoffs (8 3/4, 10 3/4, 11 1/2, and 12). Order the factor accordingly. Also create an unordered version of the size column where the `> 10` and `> 10 3/4` are lumped together.
+
+```{r}
+with(dat, table(size, F2_location))
+
+dat[, size_ordered := ordered(size, levels = c('< 8 3/4', '> 8 3/4', '> 10', '> 10 3/4', '> 11 1/2', '> 12'))]
+dat[, size_combined := ifelse(size == '> 10', '> 10 3/4', size)]
+dat[, size_combined := factor(size_combined, levels = c('< 8 3/4', '> 8 3/4', '> 10 3/4', '> 11 1/2', '> 12'))]
+```
+
+Clean up the 100-seed weight data, making sure the levels match the ones in the other data frame (ignoring difference between `> 10 3/4` and `>10`. Then join them.
+
+```{r}
+setnames(seedwt, c('population', 'size', 'max', 'soja', 'F2_location', 'year', 'ave_100sw'))
+
+seedwt[, size := gsub('>1', '> 1', size, fixed = TRUE)]
+seedwt[, size := gsub('103', '10 3', size, fixed = TRUE)]
+seedwt[max == 'NCDunpphy', max := 'NC Dunphy']
+
+seedwt_tojoin <- seedwt[, .(size, max, F2_location, ave_100sw)]
+setnames(seedwt_tojoin, old = 'size', new = 'size_combined')
+
+dat <- dat[seedwt_tojoin, on = c('size_combined', 'max', 'F2_location')]
+```
+
+Additional data cleaning. Round number planted down to the nearest integer so it can be used as number of binomial trials, and convert soja parent ID to a factor.
+
+```{r}
+dat[, n_planted_trials := as.integer(n_planted)]
+dat[, soja := factor(soja)]
+```
+
+
+## Exploratory data viz
+
+Make plots showing the values of number selected per number planted for the different combinations of predictors. Logit transform on y axis.
+
+```{r}
+pct_scale <- scale_y_continuous(trans = 'logit', name = 'percent selected', breaks = c(0.001, 0.003, 0.01, 0.03, 0.10), labels = scales::percent_format(accuracy = 0.1))
+soja_facet <- facet_wrap(~ soja, labeller = as_labeller(function(x) paste('*G. soja* parent:', x)))
+
+ggplot(dat |> transform(F3_location = ifelse(dat$F3_location == 'CLA', 'Clayton', 'FF')), 
+       aes(x = max, y = n_selected/n_planted, fill = interaction(F2_location, F3_location, sep = ' &times; '))) +
+  geom_boxplot(position = 'dodge') +
+  soja_facet +
+  labs(x = '*G. max* parent', fill = 'F<sub>2</sub> location &times; F<sub>3</sub> location') +
+  pct_scale +
+  theme(legend.position = 'bottom',
+        axis.title.x = element_markdown(),
+        legend.title = element_markdown(),
+        legend.text = element_markdown(),
+        strip.text = element_markdown()) 
+
+#ggsave('C:/Users/qdread/onedrive_usda/ars_projects/taliercio/figs/selectabilitybynursery.png', dpi = 400, height = 4, width = 7)
+```
+
+Also look at seed size.
+
+```{r}
+ggplot(dat, aes(x = max, y = n_selected/n_planted, fill = size_ordered)) +
+  geom_boxplot(position = 'dodge') +
+  soja_facet + pct_scale +
+  scale_fill_viridis_d(name = 'seed size class', 
+                       labels = c('&#60; 8 &frac34;', '&#62; 8 &frac34;', '&#62; 10', '&#62; 10 &frac34;', '&#62; 11 &frac12;', '&#62; 12')) +
+  labs(x = '*G. max* parent') +
+  theme(legend.position = 'bottom',
+        axis.title.x = element_markdown(),
+        strip.text = element_markdown(),
+        legend.text = element_markdown()) 
+
+#ggsave('selectabilitybysizeclass.png', dpi = 400, height = 4, width = 7)
+```
+
+## Fitting model
+
+The statstical model should answer the following research questions:
+
+- Does the *G. max* parent have an effect on number of harvestable plants?
+- Does the wild parent have an effect on number of harvestable plants? (Specifically, does 407191 produce more harvestable plants?)
+- Is there an effect of seed size on number of harvestable plants, or is there an interaction between seed size and *G. max* and/or *G. soja* parent?
+- Is there an effect of F2 or F3 location that needs to be considered?
+
+So based on this we will have a 3-way interaction between G. max parent, G. soja parent, and seed size as the fixed effects, and F2 nursery location and F3 nursery location as crossed random effects (random intercepts). 
+
+The other consideration is that the response variable is number selected per number planted. This is a binomial trials situation, where we are modeling how the probability of being selected varies with our different fixed and random effects. Each seed planted is a binary trial that has a certain probability of being selected (outcome = 1) or not selected (outcome = 0).
+
+All of this can be combined into a single Bayesian binomial mixed-effects regression model that will enable us to answer all the questions that the design is set up to answer, while properly controlling for any random effects that might arise from the different nurseries.
+
+In the following model, I am using the continuous variable for 100-seed weight to represent seed size. That makes the model a lot easier to deal with than if we used the categories. The formula includes the full three-way interaction and the random intercept terms. It is a binomial model with a logit link function, meaning we are comparing how the log odds changes among the different groups. Some priors are added to limit the coefficients to a reasonable range centered around zero which makes the model converge better.
+
+```{r}
+fit_binom_seedwt_full <- brm(
+  n_selected | trials(n_planted_trials) ~ max * soja * ave_100sw + (1|F2_location) + (1|F3_location),
+  data = dat, family = binomial,
+  prior = c(
+    prior('student_t(3, 0, 3)', class = 'b')
+  ),
+  iter = 6000, warmup = 4000, chains = 4, seed = 910, 
+  file = 'data/fit_binomial_seedwt_full'
+)
+```
+
+First, let's look at the model diagnostics to make sure it converged. All `Rhat` statistics (potential scale reduction factor which should be less than 1.05 for all parameters) are close to 1 which means it converged.
+
+```{r}
+summary(fit_binom_seedwt_full)
+```
+
+## Graphs of model results
+
+Now let's look at the random effect estimates. They are roughly zero so we can use the predictions and fitted values from the model averaged across the random effects. I will not drop them from the model, though, because it's recommended to use the random effects structure supported by your experimental design even if in some particular case the effects are zero. The findings are more generalizable that way (though it does decrease the power slightly). 
+
+On this plot and the following, the point is the median, the thick bar is the 66% quantile credible interval (about 1 SD), and the thin bar is the 95% quantile credible interval (about 2 SD).
+
+```{r}
+f2_effect <- fit_binom_seedwt_full %>%
+  spread_draws(r_F2_location[F2_location,term])
+f3_effect <- fit_binom_seedwt_full %>%
+  spread_draws(r_F3_location[F3_location,term])
+
+ranef_both <- rbindlist(list(f2_effect,f3_effect), use.names = FALSE)
+ranef_both[, location := factor(F2_location, levels = rev(c('Caswell','Hugo','FF','CLA')), labels = rev(c('Caswell (F<sub>2</sub>)','Hugo (F<sub>2</sub>)','FF (F<sub>3</sub>)','Clayton (F<sub>3</sub>)')))]
+
+ggplot(ranef_both,
+       aes(y = location, x = r_F2_location)) +
+  stat_sample_slabinterval(geom = 'pointinterval', point_interval = median_qi) +
+  geom_vline(xintercept = 0, color = "red", lty = 'dashed') +
+  scale_x_continuous(limits = c(-0.5, 0.5)) +
+  labs(y = 'nursery', x = 'effect') +
+  theme(axis.text.y = element_markdown())
+
+#ggsave('randomeffects.png', dpi = 400, height = 4, width = 5)
+```
+
+Next, plot the estimated marginal means for the different crosses. Here we see that the probability of selecting the progeny is uniformly higher for soja parent 407191. The NC Raleigh *max* parent may be a little worse and the NC Dunphy *max* parent a little better, but this is a relatively weak effect and does not depend on the *soja* parent.
+
+```{r}
+emm_max_soja <- emmeans(fit_binom_seedwt_full, ~ max + soja, type = "response")
+
+max_soja_toplot <- gather_emmeans_draws(emm_max_soja) |> setDT()
+max_soja_toplot[, p := plogis(.value)]
+
+ggplot(max_soja_toplot, aes(y = max, x = p)) +
+  stat_sample_slabinterval(geom = 'pointinterval', point_interval = median_qi) +
+  facet_wrap(~ soja, nrow = 2, labeller = labeller(soja = function(x) paste('*G. soja* parent:', x))) +
+  scale_x_continuous(name = 'probability of selection', trans = 'logit', breaks = c(.001, .002, .005, .01, .02, .05, .10), expand = expansion(mult = c(0, 0)), limits = c(0.0005, 0.11), labels = scales::percent_format(accuracy = 0.1)) +
+  labs(y = '*G. max* parent') +
+  theme(axis.title.y = element_markdown(), strip.text = element_markdown())
+
+#ggsave('marginalmeans_crosses.png', dpi = 400, height = 7, width = 5)
+```
+
+These are the estimated marginal trends (slopes of the selectability vs. seed weight line) for the different crosses, as well as for the individual *max* and *soja* parents averaged across the other parent. Most of them are positive as expected (increasing seed weight leads to higher percent progeny selected) but not universally. Some are neutral or even negative. The trend noticed in the exploratory plots, that there is a positive trend for selectability with seed weight in 425045 but not 407191, is supported by the model.
+
+```{r}
+swt_trends_max_soja <- emtrends(fit_binom_seedwt_full, ~ max + soja, var = 'ave_100sw', type = 'response')
+
+swt_trends_toplot <- gather_emmeans_draws(swt_trends_max_soja) |> setDT()
+
+ggplot(swt_trends_toplot, aes(y = max, x = .value)) +
+  stat_sample_slabinterval(geom = 'pointinterval', point_interval = median_qi) +
+  geom_vline(xintercept = 0, color = 'red', linetype = 'dashed') +
+  facet_wrap(~ soja, nrow = 2, labeller = labeller(soja = function(x) paste('*G. soja* parent:', x))) +
+  scale_x_continuous(name = 'slope of selectability vs. seed weight trend') +
+  labs(y = '*G. max* parent') +
+  theme(axis.title.y = element_markdown(), strip.text = element_markdown())
+
+#ggsave('seedweight_slopes_crosses.png', dpi = 400, height = 7, width = 5)
+
+swt_trends_max <- emtrends(fit_binom_seedwt_full, ~ max, var = 'ave_100sw', type = 'response')
+
+swt_trends_max_toplot <- gather_emmeans_draws(swt_trends_max) |> setDT()
+
+ggplot(swt_trends_max_toplot, aes(y = max, x = .value)) +
+  stat_sample_slabinterval(geom = 'pointinterval', point_interval = median_qi) +
+  geom_vline(xintercept = 0, color = 'red', linetype = 'dashed') +
+  scale_x_continuous(name = 'slope of selectability vs. seed weight trend') +
+  labs(y = '*G. max* parent') +
+  theme(axis.title.y = element_markdown(), strip.text = element_markdown())
+
+#ggsave('seedweight_slopes_max.png', dpi = 400, height = 4, width = 5)
+
+swt_trends_soja <- emtrends(fit_binom_seedwt_full, ~ soja, var = 'ave_100sw', type = 'response')
+
+swt_trends_soja_toplot <- gather_emmeans_draws(swt_trends_soja) |> setDT()
+
+ggplot(swt_trends_soja_toplot, aes(y = soja, x = .value)) +
+  stat_sample_slabinterval(geom = 'pointinterval', point_interval = median_qi) +
+  geom_vline(xintercept = 0, color = 'red', linetype = 'dashed') +
+  scale_x_continuous(name = 'slope of selectability vs. seed weight trend') +
+  labs(y = '*G. soja* parent') +
+  theme(axis.title.y = element_markdown(), strip.text = element_markdown())
+
+#ggsave('seedweight_slopes_soja.png', dpi = 400, height = 4, width = 5)
+```
+
+## Post hoc contrasts
+
+This section added on March 8.
+
+We have all the marginal means for the different crosses but we should also get the contrasts so that we can make quantifiable statements about differences between the means in the manuscript. These contrasts are odds ratios (ratio of the selection odds between the two groups being compared). The Bayesian model does not require any correction for multiple comparisons. An odds ratio of 1, or log odds ratio of 0, means no difference between the two groups, i.e. an identical selection probability in both.
+
+```{r}
+emm_max_soja_raw <- emmeans(fit_binom_seedwt_full, ~ max | soja)
+contr_max_soja <- contrast(emm_max_soja_raw, 'pairwise')
+
+emm_max_raw <- emmeans(fit_binom_seedwt_full, ~ max)
+contr_max <- contrast(emm_max_raw, 'pairwise')
+
+emm_soja_raw <- emmeans(fit_binom_seedwt_full, ~ soja)
+contr_soja <- contrast(emm_soja_raw, 'pairwise')
+```
+
+We can also do post hoc contrasts for the slope trends.
+
+```{r}
+swt_trends_max_bysoja <- emtrends(fit_binom_seedwt_full, ~ max | soja, var = 'ave_100sw', type = 'response')
+
+swt_contr_max_soja <- contrast(swt_trends_max_bysoja, 'pairwise')
+swt_contr_max <- contrast(swt_trends_max, 'pairwise')
+swt_contr_soja <- contrast(swt_trends_soja, 'pairwise')
+```
+
+
+## Bayes factors
+
+We are interested in assessing the strength of evidence for the different effects and comparisons in our model. If this were frequentist, we would do this by calculating a p-value. The analogue in our Bayesian model is a Bayes factor (BF). We can calculate BF for the entire model, for any single parameter, or even for a single value we extracted from the model (in this case a post hoc contrast we took). A Bayes factor is the ratio of evidence of one model (or parameter) over another. On the numerator we have the parameter estimate we got from fitting the model to data, and on the denominator we have our prior estimate based on no data. Our "naive" prior estimate for the difference between the treatments was centered around zero, so the prior essentially represents a null hypothesis. So, we are asking if there is evidence from the data that makes us believe the parameter estimate is different than our prior, zero, estimate. That makes the BF in this case basically analogous to a p-value. This should be what we provide in the manuscript because reviewers understandably want to see some analogue of a significance test: how much evidence do we have for our claim that parent A is different for parent B?
+
+Just as there are ways to interpret p-values, we can interpret Bayes factors.  If BF = 1, we have not changed our belief about the parameter at all. The prior estimate (of zero) is just as likely to be true as before. If BF > 1, we have evidence for our new estimate being true. The higher the BF, the more evidence. But if BF < 1, we actually have *more* evidence of the prior (zero) estimate being true than we did before we fit the model. There are some previously published guidelines for how to verbally describe the Bayes factors in terms of strength of evidence, which I will provide.
+
+First get the Bayes factors for the pairwise contrasts between the selectability estimates for the different crosses.
+
+```{r}
+bf_contr_max <- bayesfactor(contr_max, prior = fit_binom_seedwt_full)
+bf_contr_soja <- bayesfactor(contr_soja, prior = fit_binom_seedwt_full)
+bf_contr_max_soja <- bayesfactor(contr_max_soja, prior = fit_binom_seedwt_full)
+
+interpbf_contr_max <- interpret_bf(bf_contr_max$log_BF, log = TRUE)
+interpbf_contr_soja <- interpret_bf(bf_contr_soja$log_BF, log = TRUE)
+interpbf_contr_max_soja <- interpret_bf(bf_contr_max_soja$log_BF, log = TRUE)
+```
+
+Next, get the Bayes factors for the seed weight slope trends. (Manually create the prior estimates of trends against which our posterior estimate is compared, because the `bayesfactor()` function does not natively support calculating Bayes factors for these trends in the usual way.)
+
+```{r}
+fit_prior <- unupdate(fit_binom_seedwt_full)
+
+swt_trends_max_soja_prior <- emtrends(fit_prior, ~ max | soja, var = 'ave_100sw', type = 'response')
+swt_trends_max_prior <- emtrends(fit_prior, ~ max, var = 'ave_100sw', type = 'response')
+swt_trends_soja_prior <- emtrends(fit_prior, ~ soja, var = 'ave_100sw', type = 'response')
+
+bf_swt_max_soja <- bayesfactor(swt_trends_max_soja, prior = swt_trends_max_soja_prior)
+bf_swt_max <- bayesfactor(swt_trends_max, prior = swt_trends_max_prior)
+bf_swt_soja <- bayesfactor(swt_trends_soja, prior = swt_trends_soja_prior)
+
+interpbf_swt_max_soja <- interpret_bf(bf_swt_max_soja$log_BF, log = TRUE)
+interpbf_swt_max <- interpret_bf(bf_swt_max$log_BF, log = TRUE)
+interpbf_swt_soja <- interpret_bf(bf_swt_soja$log_BF, log = TRUE)
+```
+
+
+Next, get the Bayes factors for the pairwise contrasts between the seed weight slopes. 
+
+```{r}
+swt_contr_max_soja_prior <- contrast(swt_trends_max_soja_prior, 'pairwise')
+swt_contr_max_prior <- contrast(swt_trends_max_prior, 'pairwise')
+swt_contr_soja_prior <- contrast(swt_trends_soja_prior, 'pairwise')
+
+bf_swt_contr_max_soja <- bayesfactor(swt_contr_max_soja, prior = swt_contr_max_soja_prior)
+bf_swt_contr_max <- bayesfactor(swt_contr_max, prior = swt_contr_max_prior)
+bf_swt_contr_soja <- bayesfactor(swt_contr_soja, prior = swt_contr_soja_prior)
+
+interpbf_swt_contr_max_soja <- interpret_bf(bf_swt_contr_max_soja$log_BF, log = TRUE)
+interpbf_swt_contr_max <- interpret_bf(bf_swt_contr_max$log_BF, log = TRUE)
+interpbf_swt_contr_soja <- interpret_bf(bf_swt_contr_soja$log_BF, log = TRUE)
+```
+
+The BFs are displayed along with the contrasts and their quantiles in tables below. 
+
+## Results in tabular form
+
+Here are some tables that reproduce some of the information from the graphs above. In all cases, I give parameter estimate (median) and lower and upper bounds of the 66% and 95% credible intervals. Everything is given to 3 sig figs.
+
+### Random effects
+
+```{r, echo = FALSE}
+q_names <- c('estimate', '95% CI lower', '95% CI upper', '66% CI lower', '66% CI upper')
+q_probs <- c(0.5, 0.025, 0.975, 0.17, 0.83)
+q_cols <- paste0('q', q_probs)
+
+ranef_both[, as.data.frame(t(signif(quantile(r_F2_location, probs = q_probs), 3))), by = location] |>
+  setnames(c('location', q_names)) |>
+  knitr::kable(caption = 'Random effects')
+```
+
+### Marginal means of crosses
+
+```{r, echo = FALSE}
+emm_max_soja <- emmeans(fit_binom_seedwt_full, ~ max + soja, type = "response")
+
+emm_max_soja_table <- setDT(emm_quantile(emm_max_soja, q_probs))
+emm_max_soja_table[, (q_cols) := lapply(.SD, function(x) signif(exp(x), 3)), .SDcols = q_cols]
+
+emm_max_soja_table |>
+  setnames(c('max parent', 'soja parent', q_names)) |>
+  knitr::kable(caption = 'Marginal means of selection probability for each cross')
+```
+
+### Marginal means averaged by parent type
+
+```{r, echo = FALSE}
+emm_max <- emmeans(fit_binom_seedwt_full, ~ max, type = "response")
+emm_soja <- emmeans(fit_binom_seedwt_full, ~ soja, type = "response")
+
+emm_max_table <- setDT(emm_quantile(emm_max, q_probs))
+emm_max_table[, (q_cols) := lapply(.SD, function(x) signif(exp(x), 3)), .SDcols = q_cols]
+
+emm_soja_table <- setDT(emm_quantile(emm_soja, q_probs))
+emm_soja_table[, (q_cols) := lapply(.SD, function(x) signif(exp(x), 3)), .SDcols = q_cols]
+
+emm_max_table |>
+  setnames(c('*max* parent', q_names)) |>
+  knitr::kable(caption = 'Marginal means of selection probability for each *G. max* parent')
+
+emm_soja_table |>
+  setnames(c('*soja* parent', q_names)) |>
+  knitr::kable(caption = 'Marginal means of selection probability for each *G. soja* parent')
+```
+
+
+### Marginal trends of selectability versus seed weight for each cross
+
+Quantiles and Bayes factors are provided. Bayes factors provide a measure of the strength of evidence that the slope is different than our prior estimate centered around zero. Evidence "in favor of" means we think it is not zero, and evidence "against" means it is consistent with an estimate centered around zero.
+
+
+```{r, echo = FALSE}
+swt_trends_toplot[, as.data.frame(t(signif(quantile(.value, probs = q_probs), 3))), by = .(max, soja)] |>
+  cbind(bf = pretty_sci_not(exp(bf_swt_max_soja$log_BF)), interpretation = interpbf_swt_max_soja) |>
+  setnames(c('*max* parent', '*soja* parent', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Selectability vs seed weight trends for crosses')
+```
+
+### Marginal trends of selectability versus seed weight averaged by parent type
+
+```{r, echo = FALSE}
+swt_trends_max_toplot[, as.data.frame(t(signif(quantile(.value, probs = q_probs), 3))), by = .(max)] |>
+  cbind(bf = pretty_sci_not(exp(bf_swt_max$log_BF)), interpretation = interpbf_swt_max) |>
+  setnames(c('*max* parent', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Selectability vs seed weight trends for *G. max* parents')
+
+swt_trends_soja_toplot[, as.data.frame(t(signif(quantile(.value, probs = q_probs), 3))), by = .(soja)] |>
+  cbind(bf = pretty_sci_not(exp(bf_swt_soja$log_BF)), interpretation = interpbf_swt_soja) |>
+  setnames(c('*soja* parent', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Selectability vs seed weight trends for *G. soja* parents')
+```
+
+### Post-hoc contrasts: odds ratios of selection probability between crosses
+
+First the contrasts of pairs of *max* parents within *soja* parent are given. Then the contrasts of the averaged *max* and *soja* parents are given.
+
+Quantiles and Bayes factors are included. Verbal interpretation of Bayes factor is provided according to the cutoffs in Jeffreys 1961. Evidence "in favor of" means we think the probability of selection is different for the pair being compared, and evidence "against" means we think it's probably the same.
+
+```{r, echo = FALSE}
+contr_max_soja_table <- setDT(emm_quantile(contr_max_soja, q_probs))
+contr_max_soja_table[, (q_cols) := lapply(.SD, exp), .SDcols = q_cols]
+contr_max_soja_table[, bf := pretty_sci_not(exp(bf_contr_max_soja$log_BF))]
+contr_max_soja_table[, interp := interpbf_contr_max_soja]
+
+contr_max_table <- setDT(emm_quantile(contr_max, q_probs))
+contr_max_table[, (q_cols) := lapply(.SD, exp), .SDcols = q_cols]
+contr_max_table[, bf := pretty_sci_not(exp(bf_contr_max$log_BF))]
+contr_max_table[, interp := interpbf_contr_max]
+
+contr_soja_table <- setDT(emm_quantile(contr_soja, q_probs))
+contr_soja_table[, (q_cols) := lapply(.SD, exp), .SDcols = q_cols]
+contr_soja_table[, bf := pretty_sci_not(exp(bf_contr_soja$log_BF))]
+contr_soja_table[, interp := interpbf_contr_soja]
+
+contr_max_soja_table |>
+  setnames(c('*max* parents contrasted', '*soja* parent', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Odds ratios between crosses')
+
+contr_max_table |>
+  setnames(c('*max* parent 1', '*max* parent 2', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Odds ratios between pairs of *G. max* parents')
+
+contr_soja_table |>
+  setnames(c('*soja* parent 1', '*soja* parent 2', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Odds ratio between pair of *G. soja* parents')
+```
+
+### Post-hoc contrasts: difference in slopes of seed weight trends between crosses
+
+First the contrasts of pairs of *max* parents within *soja* parent are given. Then the contrasts of the averaged *max* and *soja* parents are given.
+
+Quantiles and Bayes factors are included. Evidence "in favor of" means we think the difference in slopes is nonzero for the pair being compared, and evidence "against" means it is consistent with a difference of zero between the slopes of the pair being compared.
+
+```{r, echo = FALSE}
+swt_contr_max_soja_table <- setDT(emm_quantile(swt_contr_max_soja, q_probs))
+swt_contr_max_soja_table[, bf := pretty_sci_not(exp(bf_swt_contr_max_soja$log_BF))]
+swt_contr_max_soja_table[, interp := interpbf_swt_contr_max_soja]
+
+swt_contr_max_table <- setDT(emm_quantile(contr_max, q_probs))
+swt_contr_max_table[, bf := pretty_sci_not(exp(bf_swt_contr_max$log_BF))]
+swt_contr_max_table[, interp := interpbf_swt_contr_max]
+
+swt_contr_soja_table <- setDT(emm_quantile(contr_soja, q_probs))
+swt_contr_soja_table[, bf := pretty_sci_not(exp(bf_swt_contr_soja$log_BF))]
+swt_contr_soja_table[, interp := interpbf_swt_contr_soja]
+
+swt_contr_max_soja_table |>
+  setnames(c('*max* parents contrasted', '*soja* parent', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Comparison of seed weight trend slopes between crosses')
+
+swt_contr_max_table |>
+  setnames(c('*max* parent 1', '*max* parent 2', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Comparison of seed weight trend slopes between pairs of *G. max* parents')
+
+swt_contr_soja_table |>
+  setnames(c('*soja* parent 1', '*soja* parent 2', q_names, 'Bayes factor', 'interpretation')) |>
+  knitr::kable(digits = 3, caption = 'Comparison of seed weight trend slopes between pair of *G. soja* parents')
+```
+
+### Additional figure: size class trends with model and data overlaid
+
+Here is a plot that has both the fitted values and data values (average 100-seed weight) for each cross showing the selectability vs. seed weight trends. This is an alternative to Fig 5 in the MS version from early March.
+
+```{r}
+pred_grid <- CJ(max = unique(dat$max), soja = unique(dat$soja), ave_100sw = seq(3.2, 9.2, 0.1), n_planted_trials = 1000)
+
+fitted_vals <- fitted(fit_binom_seedwt_full, newdata = pred_grid, re_formula = ~ 0, summary = FALSE)
+
+fitted_quant <- cbind(pred_grid, t(fitted_vals))
+fitted_quant <- melt(fitted_quant, id.vars = 1:4)
+fitted_quant[, value := value/n_planted_trials]
+fitted_quant <- fitted_quant[, as.data.frame(t(quantile(value, probs = q_probs))), by = .(max, soja, ave_100sw)]
+setnames(fitted_quant, c('max','soja','ave_100sw', q_cols))
+
+ggplot(dat, aes(x = ave_100sw)) +
+  geom_point(aes(y = n_selected/n_planted)) +
+  geom_ribbon(data = fitted_quant, aes(ymin = q0.17, ymax = q0.83), alpha = 0.3) +
+  geom_line(data = fitted_quant, aes(y = q0.5)) +
+  geom_line(data = fitted_quant, aes(y = q0.025), linetype = 'dotted') +
+  geom_line(data = fitted_quant, aes(y = q0.975), linetype = 'dotted') +
+  facet_grid(max ~ soja) +
+  pct_scale +
+  labs(x = '100-seed weight') +
+  theme(legend.position = 'bottom',
+        axis.title.x = element_markdown(),
+        strip.text = element_markdown(),
+        legend.text = element_markdown()) 
+
+#ggsave('selectabilitybysize_modelsanddata.png', dpi = 400, height = 8, width = 5)
+```
+
