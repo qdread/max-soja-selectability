@@ -1,5 +1,7 @@
 # max x soja Selectability Analysis
 
+[![DOI](https://zenodo.org/badge/475462607.svg)](https://zenodo.org/badge/latestdoi/475462607)
+
 This repo contains all code and data required to reproduce the progeny selectability analysis presented in the manuscript:
 
 Taliercio, E., Eickholt, D., Read, Q. D., Carter, T., Waldeck, N., and Fallen, B. 2022. The impacts of parental choice and seed size on the quality of progeny derived from crosses between *Glycine max* and *Glycine soja*. In preparation.
